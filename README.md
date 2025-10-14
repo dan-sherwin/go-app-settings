@@ -243,6 +243,39 @@ Registers a `url.URL` setting with a specified name, description, and pointer to
 
 ---
 
+## Testing
+
+This repository includes unit tests that can be executed locally and in any CI environment that has Go installed.
+
+- Minimum Go version: 1.22
+- Run all tests:
+
+```bash
+go test ./...
+```
+
+The tests use a temporary on-disk SQLite database via GORM; no external services are required. They also capture stdout for commands that print tables.
+
+### Example: GitHub Actions CI
+
+If you want to run the tests in GitHub Actions, you can use a minimal workflow like this:
+
+```yaml
+name: go-test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+      - run: go test ./...
+```
+
+---
+
 ## License
 
 ISC

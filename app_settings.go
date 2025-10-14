@@ -97,9 +97,9 @@ func Setup(settingsFileName string, options SettingsOptions) error {
 	return RetrieveAppSettings()
 }
 
-// getSetting retrieves a `Setting` by its name from the global list `settings`.
+// GetSetting retrieves a `Setting` by its name from the global list `settings`.
 // If no match is found, it returns `nil`.
-func getSetting(name string) (*Setting, error) {
+func GetSetting(name string) (*Setting, error) {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
 	if !slices.ContainsFunc(settings, func(s *Setting) bool {
@@ -120,7 +120,7 @@ func getSetting(name string) (*Setting, error) {
 // It identifies the setting by name, deletes it from the database, and handles any errors encountered during the operation.
 // On success, it prints a confirmation message.
 func (c *SettingsRemoveCommand) Run() error {
-	setting, err := getSetting(c.Setting)
+	setting, err := GetSetting(c.Setting)
 	if err != nil {
 		return printAndReturnErr(err)
 	}
@@ -132,21 +132,32 @@ func (c *SettingsRemoveCommand) Run() error {
 	return nil
 }
 
-// Run executes the command to update a specific application setting with a provided value and persists it in the database.
-func (c *SettingsSaveCommand) Run() error {
-	setting, err := getSetting(c.Setting)
+// SetSetting updates the value of a specified setting by its name.
+// Converts the provided value to a string and applies it using the setting's SetFunc.
+// Saves the updated setting to the database and returns an error if any operation fails.
+func SetSetting(settingName string, value any) error {
+	setting, err := GetSetting(settingName)
 	if err != nil {
-		return printAndReturnErr(err)
+		return err
 	}
-
-	if err := setting.SetFunc(c.Value); err != nil {
-		return printAndReturnErr(err)
+	valueStr := fmt.Sprintf("%v", value)
+	if err := setting.SetFunc(valueStr); err != nil {
+		return err
 	}
 	if err := db.AppSetting.Save(&models.AppSetting{
 		Key:   setting.Name,
-		Value: c.Value,
+		Value: valueStr,
 	}); err != nil {
-		return printAndReturnErr(fmt.Errorf("Error saving setting %s: %w", c.Setting, err))
+		return err
+	}
+	return nil
+}
+
+// Run executes the command to update a specific application setting with a provided value and persists it in the database.
+func (c *SettingsSaveCommand) Run() error {
+	err := SetSetting(c.Setting, c.Value)
+	if err != nil {
+		return printAndReturnErr(err)
 	}
 	fmt.Printf("Setting %s saved to %s\n", c.Setting, c.Value)
 	return nil
@@ -205,7 +216,7 @@ func (c *SettingsListSavedCommand) Run() error {
 	}
 	savedSettings := []models.AppSetting{}
 	for _, as := range s {
-		setting, err := getSetting(as.Key)
+		setting, err := GetSetting(as.Key)
 		if err != nil {
 			continue
 		}
@@ -223,7 +234,7 @@ func (c *SettingsListActiveCommand) Run() error {
 	}
 	activeSettings := defaultSettings
 	for _, ss := range s {
-		setting, err := getSetting(ss.Key)
+		setting, err := GetSetting(ss.Key)
 		if err != nil {
 			continue
 		}
@@ -283,7 +294,7 @@ func RetrieveAppSettings() error {
 	errs := []error{}
 	if appSettings != nil {
 		for _, as := range appSettings {
-			if s, err := getSetting(as.Key); err == nil {
+			if s, err := GetSetting(as.Key); err == nil {
 				err := s.SetFunc(as.Value)
 				if err != nil {
 					errs = append(errs, fmt.Errorf("Error setting setting %s: %w", as.Key, err))
