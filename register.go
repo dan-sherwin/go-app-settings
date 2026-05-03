@@ -1,6 +1,7 @@
 package app_settings
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -41,6 +42,53 @@ func RegisterStringSetting(name string, description string, prop *string) {
 			return nil
 		},
 	})
+}
+
+func RegisterJSONSetting[T any](name, description string, prop *T) {
+	RegisterJSONSettingWithValidator(name, description, prop, nil)
+}
+
+func RegisterJSONSettingWithValidator[T any](name, description string, prop *T, validate func(T) error) {
+	RegisterSetting(&Setting{
+		Name:              name,
+		Description:       description,
+		ValueToStringFunc: jsonValueToString,
+		GetFunc: func() string {
+			b, err := json.Marshal(*prop)
+			if err != nil {
+				return ""
+			}
+			return string(b)
+		},
+		SetFunc: func(s string) error {
+			var value T
+			if err := json.Unmarshal([]byte(s), &value); err != nil {
+				return err
+			}
+			if validate != nil {
+				if err := validate(value); err != nil {
+					return err
+				}
+			}
+			*prop = value
+			return nil
+		},
+	})
+}
+
+func jsonValueToString(value any) (string, error) {
+	switch v := value.(type) {
+	case string:
+		return v, nil
+	case []byte:
+		return string(v), nil
+	default:
+		b, err := json.Marshal(value)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
 }
 
 // RegisterIntSetting registers an integer setting with a name, description, and a pointer to the integer property.

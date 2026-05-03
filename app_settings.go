@@ -17,11 +17,14 @@ import (
 	"gorm.io/gorm"
 )
 
+const DefaultTableName = models.TableNameAppSetting
+
 // SettingsOptions defines configuration options for listing running settings.
 type (
 	SettingsOptions struct {
 		RpcSocketPathToListRunningSettings string
 		KongVars                           *kong.Vars
+		TableName                          string
 	}
 	SettingsDef struct {
 		Logging struct {
@@ -56,10 +59,12 @@ type (
 		Setting string `arg:"" help:"Setting to remove" required:""`
 	}
 	Setting struct {
-		SetFunc     func(string) error
-		GetFunc     func() string
-		Name        string
-		Description string
+		SetFunc           func(string) error
+		GetFunc           func() string
+		ValueToStringFunc func(any) (string, error)
+		Name              string
+		Description       string
+		Hidden            bool
 	}
 
 	SettingReceiver interface {
@@ -84,9 +89,20 @@ var (
 // It configures the database, sets up the RPC socket if specified, merges Kong variables, and retrieves application settings.
 // Returns an error if any initialization step fails.
 func Setup(settingsFileName string, options SettingsOptions) error {
-	if err := db.DBInit(settingsFileName); err != nil {
+	if err := db.DBInitWithTable(settingsFileName, options.tableName()); err != nil {
 		return err
 	}
+	return setup(options)
+}
+
+func SetupWithDB(gormDB *gorm.DB, options SettingsOptions) error {
+	if err := db.DBInitWithDB(gormDB, options.tableName()); err != nil {
+		return err
+	}
+	return setup(options)
+}
+
+func setup(options SettingsOptions) error {
 	if options.RpcSocketPathToListRunningSettings != "" {
 		socketPath = options.RpcSocketPathToListRunningSettings
 		rpc.Register(&SettingsListRunningCommand{})
@@ -95,6 +111,13 @@ func Setup(settingsFileName string, options SettingsOptions) error {
 		utilities.MergeInto(*options.KongVars, SettingsVars())
 	}
 	return RetrieveAppSettings()
+}
+
+func (o SettingsOptions) tableName() string {
+	if o.TableName == "" {
+		return DefaultTableName
+	}
+	return o.TableName
 }
 
 // GetSetting retrieves a `Setting` by its name from the global list `settings`.
@@ -116,11 +139,22 @@ func GetSetting(name string) (*Setting, error) {
 	}
 }
 
+func getCLISetting(name string) (*Setting, error) {
+	setting, err := GetSetting(name)
+	if err != nil {
+		return nil, err
+	}
+	if setting.Hidden {
+		return nil, fmt.Errorf("setting %s is not available through the settings command", name)
+	}
+	return setting, nil
+}
+
 // Run removes the specified application setting if it exists, otherwise returns an error.
 // It identifies the setting by name, deletes it from the database, and handles any errors encountered during the operation.
 // On success, it prints a confirmation message.
 func (c *SettingsRemoveCommand) Run() error {
-	setting, err := GetSetting(c.Setting)
+	setting, err := getCLISetting(c.Setting)
 	if err != nil {
 		return printAndReturnErr(err)
 	}
@@ -140,7 +174,10 @@ func SetSetting(settingName string, value any) error {
 	if err != nil {
 		return err
 	}
-	valueStr := fmt.Sprintf("%v", value)
+	valueStr, err := setting.ValueToString(value)
+	if err != nil {
+		return err
+	}
 	if err := setting.SetFunc(valueStr); err != nil {
 		return err
 	}
@@ -155,8 +192,22 @@ func SetSetting(settingName string, value any) error {
 
 // Run executes the command to update a specific application setting with a provided value and persists it in the database.
 func (c *SettingsSaveCommand) Run() error {
-	err := SetSetting(c.Setting, c.Value)
+	setting, err := getCLISetting(c.Setting)
 	if err != nil {
+		return printAndReturnErr(err)
+	}
+	valueStr, err := setting.ValueToString(c.Value)
+	if err != nil {
+		return printAndReturnErr(err)
+	}
+	err = setting.SetFunc(valueStr)
+	if err != nil {
+		return printAndReturnErr(err)
+	}
+	if err := db.AppSetting.Save(&models.AppSetting{
+		Key:   setting.Name,
+		Value: valueStr,
+	}); err != nil {
 		return printAndReturnErr(err)
 	}
 	fmt.Printf("Setting %s saved to %s\n", c.Setting, c.Value)
@@ -192,6 +243,9 @@ func (c *SettingsListRunningCommand) GetRunningSettings(_ *struct{}, data *[]mod
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
 	for _, s := range settings {
+		if s.Hidden {
+			continue
+		}
 		runningSettings = append(runningSettings, models.AppSetting{
 			Key:         s.Name,
 			Value:       s.GetFunc(),
@@ -204,7 +258,7 @@ func (c *SettingsListRunningCommand) GetRunningSettings(_ *struct{}, data *[]mod
 
 // Run executes the command to display default application settings in a sorted table format. It uses the printSettings function to handle the output of pre-defined settings. Returns nil upon successful execution.
 func (c *SettingsListDefaultsCommand) Run() error {
-	printSettings(defaultSettings)
+	printSettings(visibleAppSettings(defaultSettings))
 	return nil
 }
 
@@ -217,13 +271,13 @@ func (c *SettingsListSavedCommand) Run() error {
 	savedSettings := []models.AppSetting{}
 	for _, as := range s {
 		setting, err := GetSetting(as.Key)
-		if err != nil {
+		if err != nil || setting.Hidden {
 			continue
 		}
 		as.Description = setting.Description
 		savedSettings = append(savedSettings, *as)
 	}
-	printSettings(s)
+	printSettings(appSettingValuesToPointers(savedSettings))
 	return nil
 }
 
@@ -232,10 +286,10 @@ func (c *SettingsListActiveCommand) Run() error {
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return fmt.Errorf("Error getting saved settings: %w", err)
 	}
-	activeSettings := defaultSettings
+	activeSettings := visibleAppSettings(defaultSettings)
 	for _, ss := range s {
 		setting, err := GetSetting(ss.Key)
-		if err != nil {
+		if err != nil || setting.Hidden {
 			continue
 		}
 		for _, as := range activeSettings {
@@ -260,6 +314,35 @@ func printSettings(settings []*models.AppSetting) {
 		table.Append([]string{s.Key, s.Value, s.Description})
 	}
 	table.Render()
+}
+
+func visibleAppSettings(source []*models.AppSetting) []*models.AppSetting {
+	buf := []*models.AppSetting{}
+	for _, s := range source {
+		setting, err := GetSetting(s.Key)
+		if err != nil || setting.Hidden {
+			continue
+		}
+		cp := *s
+		buf = append(buf, &cp)
+	}
+	return buf
+}
+
+func appSettingValuesToPointers(source []models.AppSetting) []*models.AppSetting {
+	buf := make([]*models.AppSetting, 0, len(source))
+	for _, s := range source {
+		cp := s
+		buf = append(buf, &cp)
+	}
+	return buf
+}
+
+func (s *Setting) ValueToString(value any) (string, error) {
+	if s.ValueToStringFunc != nil {
+		return s.ValueToStringFunc(value)
+	}
+	return fmt.Sprintf("%v", value), nil
 }
 
 // SettingsVars constructs a kong.Vars map by iterating through all settings, retrieving their values using associated getters, and populating the map with setting names as keys and their retrieved values as values.

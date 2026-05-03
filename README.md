@@ -40,6 +40,35 @@ if err != nil {
 }
 ```
 
+If your application already owns a GORM database and you want `app_settings` to
+share that database, use `SetupWithDB()`:
+
+```go
+gormDB, err := gorm.Open(sqlite.Open("myapp.db"), &gorm.Config{})
+if err != nil {
+    log.Fatalf("open db failed: %v", err)
+}
+
+// Migrate application tables first.
+if err := gormDB.AutoMigrate(&LaunchItem{}, &LaunchGroup{}); err != nil {
+    log.Fatalf("app migration failed: %v", err)
+}
+
+if err := app_settings.SetupWithDB(gormDB, app_settings.SettingsOptions{}); err != nil {
+    log.Fatalf("settings setup failed: %v", err)
+}
+```
+
+By default, the settings table is named `app_settings`. If your application
+already has an incompatible table by that name, setup returns an error. Use
+`SettingsOptions.TableName` to store settings in a different table:
+
+```go
+err := app_settings.SetupWithDB(gormDB, app_settings.SettingsOptions{
+    TableName: "runtime_settings",
+})
+```
+
 ---
 
 ## Registering Settings
@@ -61,6 +90,26 @@ app_settings.RegisterSetting(&app_settings.Setting{
     },
 })
 ```
+
+Settings can be hidden from Kong `settings` commands while remaining available
+to application code:
+
+```go
+app_settings.RegisterSetting(&app_settings.Setting{
+    Name:        "internal_token",
+    Description: "Internal token",
+    Hidden:      true,
+    GetFunc:     func() string { return internalToken },
+    SetFunc: func(s string) error {
+        internalToken = s
+        return nil
+    },
+})
+```
+
+Hidden settings are loaded from the database and can be changed with
+`app_settings.SetSetting(...)`, but they are excluded from `settings list ...`
+commands and cannot be saved or removed through the `settings` CLI.
 
 ### Option 2: Struct-Based Receiver
 
@@ -191,6 +240,18 @@ Registers a `net.IP` setting with a specified name, description, and pointer to 
 func RegisterStringSetting(name, description string, prop *string)
 ```  
 Registers a string setting with a specified name, description, and pointer to the `string` property.
+
+**RegisterJSONSetting**
+```go
+func RegisterJSONSetting[T any](name, description string, prop *T)
+```
+Registers a JSON setting backed by a typed Go value. Values are stored as JSON text in the settings table.
+
+**RegisterJSONSettingWithValidator**
+```go
+func RegisterJSONSettingWithValidator[T any](name, description string, prop *T, validate func(T) error)
+```
+Registers a JSON setting and validates decoded values before applying them.
 
 **RegisterStringSliceSetting**  
 ```go

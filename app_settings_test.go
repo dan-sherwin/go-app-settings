@@ -9,6 +9,8 @@ import (
 
 	"github.com/dan-sherwin/go-app-settings/db"
 	"github.com/dan-sherwin/go-app-settings/db/models"
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
 )
 
 // test helpers
@@ -210,5 +212,157 @@ func TestRemoveCommand_RemovesFromDB(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Fatalf("expected empty DB, got: %#v", got)
+	}
+}
+
+func TestHiddenSettings_AreNotAvailableThroughCLI(t *testing.T) {
+	resetGlobals()
+	visible := "visible-default"
+	hidden := "hidden-default"
+	RegisterStringSetting("visible", "Visible setting", &visible)
+	RegisterSetting(&Setting{
+		Name:        "hidden",
+		Description: "Hidden setting",
+		Hidden:      true,
+		GetFunc:     func() string { return hidden },
+		SetFunc: func(s string) error {
+			hidden = s
+			return nil
+		},
+	})
+
+	if err := Setup(tempDBPath(t), SettingsOptions{}); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if err := SetSetting("hidden", "hidden-saved"); err != nil {
+		t.Fatalf("programmatic SetSetting for hidden setting failed: %v", err)
+	}
+	if hidden != "hidden-saved" {
+		t.Fatalf("hidden setting was not updated, got %q", hidden)
+	}
+
+	defaultsOut := captureStdout(func() {
+		_ = (&SettingsListDefaultsCommand{}).Run()
+	})
+	if strings.Contains(defaultsOut, "hidden") || !strings.Contains(defaultsOut, "visible") {
+		t.Fatalf("defaults output did not hide hidden setting: %s", defaultsOut)
+	}
+
+	running := []models.AppSetting{}
+	if err := (&SettingsListRunningCommand{}).GetRunningSettings(&struct{}{}, &running); err != nil {
+		t.Fatalf("GetRunningSettings failed: %v", err)
+	}
+	for _, s := range running {
+		if s.Key == "hidden" {
+			t.Fatalf("running settings included hidden setting: %#v", running)
+		}
+	}
+
+	if err := (&SettingsSaveCommand{Setting: "hidden", Value: "cli-value"}).Run(); err == nil {
+		t.Fatalf("expected CLI save for hidden setting to fail")
+	}
+	if err := (&SettingsRemoveCommand{Setting: "hidden"}).Run(); err == nil {
+		t.Fatalf("expected CLI remove for hidden setting to fail")
+	}
+	if got := SettingsVars()["hidden"]; got != "hidden-saved" {
+		t.Fatalf("SettingsVars should keep hidden settings available to the app, got %q", got)
+	}
+}
+
+func TestRegisterJSONSetting_SettingPersistenceAndValidation(t *testing.T) {
+	resetGlobals()
+	type launchLayout struct {
+		ViewMode string `json:"viewMode"`
+		Columns  int    `json:"columns"`
+	}
+	layout := launchLayout{ViewMode: "list", Columns: 1}
+	RegisterJSONSettingWithValidator("layout", "Launch layout", &layout, func(value launchLayout) error {
+		if value.Columns < 1 {
+			return os.ErrInvalid
+		}
+		return nil
+	})
+
+	if err := Setup(tempDBPath(t), SettingsOptions{}); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if got := SettingsVars()["layout"]; got != `{"viewMode":"list","columns":1}` {
+		t.Fatalf("unexpected default JSON setting: %s", got)
+	}
+	if err := SetSetting("layout", launchLayout{ViewMode: "grid", Columns: 4}); err != nil {
+		t.Fatalf("SetSetting with struct failed: %v", err)
+	}
+	if layout.ViewMode != "grid" || layout.Columns != 4 {
+		t.Fatalf("layout was not updated from struct value: %#v", layout)
+	}
+	if err := SetSetting("layout", `{"viewMode":"list","columns":2}`); err != nil {
+		t.Fatalf("SetSetting with JSON string failed: %v", err)
+	}
+	if layout.ViewMode != "list" || layout.Columns != 2 {
+		t.Fatalf("layout was not updated from JSON string: %#v", layout)
+	}
+	if err := SetSetting("layout", `{"viewMode":"grid","columns":0}`); err == nil {
+		t.Fatalf("expected validation error for invalid JSON setting")
+	}
+}
+
+func TestSetupWithDB_UsesApplicationDatabase(t *testing.T) {
+	resetGlobals()
+	type LaunchItem struct {
+		ID   uint `gorm:"primaryKey"`
+		Name string
+	}
+	var foo string
+	foo = "default"
+	RegisterStringSetting("foo", "Foo setting", &foo)
+
+	gormDB, err := gorm.Open(sqlite.Open(tempDBPath(t)), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open app db failed: %v", err)
+	}
+	if err := gormDB.AutoMigrate(&LaunchItem{}); err != nil {
+		t.Fatalf("app migration failed: %v", err)
+	}
+	if err := SetupWithDB(gormDB, SettingsOptions{}); err != nil {
+		t.Fatalf("SetupWithDB failed: %v", err)
+	}
+	if !gormDB.Migrator().HasTable("launch_items") {
+		t.Fatalf("expected app table to remain available")
+	}
+	if !gormDB.Migrator().HasTable(DefaultTableName) {
+		t.Fatalf("expected app_settings table in app database")
+	}
+	if err := SetSetting("foo", "persisted"); err != nil {
+		t.Fatalf("SetSetting failed: %v", err)
+	}
+	var count int64
+	if err := gormDB.Table(DefaultTableName).Where("key = ? AND value = ?", "foo", "persisted").Count(&count).Error; err != nil {
+		t.Fatalf("query app_settings failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected setting in shared app database, count=%d", count)
+	}
+}
+
+func TestSetupWithDB_TableConflictAndCustomTableName(t *testing.T) {
+	resetGlobals()
+	var foo string
+	RegisterStringSetting("foo", "Foo setting", &foo)
+
+	gormDB, err := gorm.Open(sqlite.Open(tempDBPath(t)), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open app db failed: %v", err)
+	}
+	if err := gormDB.Exec("CREATE TABLE app_settings (id integer primary key, bogus text)").Error; err != nil {
+		t.Fatalf("create conflicting table failed: %v", err)
+	}
+	if err := SetupWithDB(gormDB, SettingsOptions{}); err == nil {
+		t.Fatalf("expected incompatible app_settings table to fail setup")
+	}
+	if err := SetupWithDB(gormDB, SettingsOptions{TableName: "runtime_settings"}); err != nil {
+		t.Fatalf("SetupWithDB with custom table name failed: %v", err)
+	}
+	if !gormDB.Migrator().HasTable("runtime_settings") {
+		t.Fatalf("expected custom settings table")
 	}
 }
