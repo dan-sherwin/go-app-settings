@@ -28,7 +28,7 @@ type (
 	}
 	SettingsDef struct {
 		Logging struct {
-			Level string `enum:"debug,info,warn,error" default:"${logging_level}" help:"debug, info, warn, error" group:"logging"`
+			Level string `enum:"debug,debug2,debug3,debug4,debug5,info,warn,error" default:"${logging_level}" help:"debug, debug2, debug3, debug4, debug5, info, warn, error" group:"logging"`
 		} `embed:"" prefix:"logging."`
 		Settings SettingsCommand `cmd:"" help:"Settings" group:"App Settings"`
 	}
